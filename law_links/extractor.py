@@ -10,7 +10,9 @@ Steps:
    (law_links.context);
 5. a chain with no law after it takes a law named before it in the same
    sentence ("Согласно Уголовному кодексу РФ ... статьёй 105"), unless it
-   is followed by the next chain of an enumeration;
+   is followed by the next chain of an enumeration; a chain followed by
+   "вышеназванного Закона" with no earlier chain of a law of that kind
+   takes a law of that kind named before it in any sentence;
 6. in an enumeration ("ч. 6 ст. 15, ст.ст. 64 и 73 УК РФ") a chain without
    a law takes the law of the next chain;
 7. lists of values are expanded into separate links.
@@ -23,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Protocol, Tuple
 
+from law_links.aliases import extend as extend_aliases
 from law_links.chains import Chain, ChainTagger
 from law_links.context import AnaphoraResolver, ContextNB
 from law_links.lemmas import Lemmatizer
@@ -61,7 +64,7 @@ class Extractor:
 
     @classmethod
     def from_files(cls, aliases_path: Path, chain_model_path: Path) -> "Extractor":
-        aliases = json.loads(Path(aliases_path).read_text("utf-8"))
+        aliases = extend_aliases(json.loads(Path(aliases_path).read_text("utf-8")))
         lemmatizer = Lemmatizer()
         return cls(
             ChainTagger.from_file(chain_model_path),
@@ -78,15 +81,21 @@ class Extractor:
         chains = self.chains.find(norm)
         laws: List[Optional[LawMention]] = [self.resolver.resolve(norm, c) for c in chains]
         for i, chain in enumerate(chains):
+            wants_code = None
             if laws[i] is None and self.anaphora is not None:
                 laws[i] = self.anaphora.resolve(norm, chain.end, laws[:i])
+                wants_code = self.anaphora.wants_code(norm, chain.end)
             if laws[i] is None and not (
                 i + 1 < len(chains) and _ENUM_GAP_RE.match(norm[chain.end : chains[i + 1].start])
             ):
                 # Only text after the last law named to the right of an
-                # earlier chain: that law belongs to the earlier chain.
+                # earlier chain: that law belongs to the earlier chain. A
+                # chain followed by "вышеназванного Закона" takes a law of
+                # that kind named before it, in an earlier sentence too.
                 left = max((m.end for c, m in zip(chains, laws[:i]) if m is not None and m.start >= c.end), default=0)
-                laws[i] = self.resolver.resolve_left(norm, chain, left)
+                named = self.resolver.resolve_left(norm, chain, left, one_sentence=wants_code is None)
+                if named is not None and (wants_code is None or (named.law_id in self.anaphora.codes) == wants_code):
+                    laws[i] = named
             mention = laws[i]
             if mention is not None and len(mention.candidates) > 1 and self.context_nb is not None:
                 start, end = min(chain.start, mention.start), max(chain.end, mention.end)
