@@ -237,19 +237,8 @@ def decode(tokens: Sequence[Tok], tags: Sequence[str]) -> List[Chain]:
         if tag == "VD" and cur["part"]:
             cur["VD"].append(value_text(tok.text))
         if tag in ("VA", "VP", "VS"):
-            if (
-                tag == "VS"
-                and tok.text.lower() == "и"
-                and i > 0
-                and i + 1 < len(tokens)
-                and tokens[i - 1].text in ('»', '"')
-                and tokens[i + 1].text in ('«', '"')
-            ):
-                continue
-
             if not tok.text[0].isdigit() and len(tok.text) > 2:
                 cur["ordinal"] = True
-
             cur[tag].append(value_text(tok.text))
             cur["end"] = tok.end
     close()
