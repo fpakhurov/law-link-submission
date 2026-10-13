@@ -36,11 +36,17 @@ class AnaphoraResolver:
     def __init__(self, aliases: Dict[str, List[str]]) -> None:
         self.codes = {int(k) for k, names in aliases.items() if any("кодекс" in n.lower() for n in names)}
 
+    def wants_code(self, text: str, chain_end: int) -> Optional[bool]:
+        """Whether the words after a chain point to a code (True), to another
+        act (False) or to nothing (None)."""
+        match = _ANAPHORA_RE.match(text[chain_end : chain_end + 60])
+        return None if match is None else (match.group("kind") or match.group("bare")).lower().startswith("кодекс")
+
     def resolve(self, text: str, chain_end: int, previous: Sequence[Optional[LawMention]]) -> Optional[LawMention]:
         match = _ANAPHORA_RE.match(text[chain_end : chain_end + 60])
         if not match:
             return None
-        want_code = (match.group("kind") or match.group("bare")).lower().startswith("кодекс")
+        want_code = self.wants_code(text, chain_end)
         for mention in reversed(previous):
             if mention is not None and (mention.law_id in self.codes) == want_code:
                 return LawMention(mention.law_id, chain_end + match.start(), chain_end + match.end(), (mention.law_id,))

@@ -31,6 +31,12 @@ _STOP_RE = re.compile(
     re.IGNORECASE,
 )
 _SENTENCE_END_RE = re.compile(r"(?<=[а-яa-z0-9)\"])\.\s+(?=[А-ЯA-Z])|;")
+_MONTHS = {
+    m: i
+    for i, m in enumerate(
+        "январь февраль март апрель май июнь июль август сентябрь октябрь ноябрь декабрь".split(), 1
+    )
+}
 # A law name before a chain must have a document word in it.
 _DOC_WORD_RE = re.compile(
     r"(?i:кодекс|закон|конституц|указ|постановлени|регламент|\bфз\b)|\b(?:[А-Я]{1,3}К\s+РФ|КоАП)\b"
@@ -69,7 +75,7 @@ class LawResolver:
         self.alias_keys: List[str] = []
         for law_id, names in aliases.items():
             for name in names:
-                self.alias_keys.append(self.lemmatizer.text(normalize(name)))
+                self.alias_keys.append(self.text_key(normalize(name)))
                 self.alias_law.append(int(law_id))
         self.alias_law_arr = np.array(self.alias_law)
         self.vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=ngram_range, sublinear_tf=True)
@@ -115,11 +121,39 @@ class LawResolver:
         if stop:
             window = window[: stop.start()]
         tokens = [Token(self.spell(t.text), t.start, t.end) for t in tokenize(window)[: self.max_tokens]]
-        lemmas = [self.lemmatizer.key(t) for t in tokens]
+        keys = self.keys(tokens)
         return [
-            (chain.end + tokens[0].start, chain.end + tokens[k - 1].end, " ".join(lemmas[:k]))
+            (chain.end + tokens[0].start, chain.end + tokens[k - 1].end, " ".join(filter(None, keys[:k])))
             for k in range(1, len(tokens) + 1)
+            if keys[k - 1]
         ]
+
+    def keys(self, tokens: List[Token]) -> List[str]:
+        """Lemma per token, with the forms of one thing made equal: a date in
+        words "27 июля 2006 года" -> "27.07.2006" (the dictionary writes
+        "от 27.07.2006"), "ФЗ № 149" -> "фз 149-фз", "N 127-ФЗ" without "N".
+        Tokens merged into a neighbour get an empty key."""
+        keys = [self.lemmatizer.key(t) for t in tokens]
+        for i, key in enumerate(keys):
+            if (
+                key.isdigit()
+                and len(key) <= 2
+                and i + 2 < len(keys)
+                and keys[i + 1] in _MONTHS
+                and re.fullmatch(r"\d{4}", keys[i + 2])
+            ):
+                keys[i] = f"{int(key):02d}.{_MONTHS[keys[i + 1]]:02d}.{keys[i + 2]}"
+                keys[i + 1] = keys[i + 2] = ""
+                if i + 3 < len(keys) and keys[i + 3] in ("г", "год"):
+                    keys[i + 3] = ""
+            elif key.isdigit() and i > 0 and keys[i - 1] == "фз":
+                keys[i] = key + "-фз"
+            elif key in ("n", "no") and i + 1 < len(keys) and keys[i + 1][:1].isdigit():
+                keys[i] = ""
+        return keys
+
+    def text_key(self, text: str) -> str:
+        return " ".join(filter(None, self.keys(tokenize(text))))
 
     def spell(self, word: str) -> str:
         """The alias word form one edit away from an unknown word, or the word."""
@@ -142,10 +176,15 @@ class LawResolver:
         if not cands:
             return None
         # A prefix equal to an alias has similarity 1.0, the maximum: the
-        # shortest such prefix is what the full search would pick.
-        for start, end, key in cands:
+        # shortest such prefix is what the full search would pick. The span
+        # runs on while longer prefixes name the same laws ("КоАП" "РФ").
+        for i, (start, end, key) in enumerate(cands):
             if key in self._exact:
                 laws = self._exact[key]
+                for _, longer_end, longer in cands[i + 1 :]:
+                    if self._exact.get(longer) != laws:
+                        break
+                    end = longer_end
                 return LawMention(laws[0], start, end, laws)
         scored = self.best_aliases([c[2] for c in cands])
         best_c = max(range(len(cands)), key=lambda i: (scored[i][0], -i))
@@ -155,7 +194,7 @@ class LawResolver:
         start, end, _ = cands[best_c]
         return LawMention(laws[0], start, end, laws)
 
-    def resolve_left(self, text: str, chain: Chain, start: int) -> Optional[LawMention]:
+    def resolve_left(self, text: str, chain: Chain, start: int, one_sentence: bool = True) -> Optional[LawMention]:
         """A law named before a chain in the same sentence ("Согласно
         Уголовному кодексу РФ ... статьёй 105"). Every word span of
         text[start:chain.start] after the last sentence end that has a
@@ -163,20 +202,22 @@ class LawResolver:
         the best span wins, the one closest to the chain on a tie. Short
         alias titles ("О связи") are too common as plain words to be taken
         without one. A chain followed by a document name unknown to the
-        aliases ("статьи 25 Федерального закона ...") is left alone."""
+        aliases ("статьи 25 Федерального закона ...") is left alone.
+        `one_sentence=False` looks past sentence ends, for a chain pointing
+        back with "вышеназванного Закона"."""
         if _DOC_AFTER_RE.match(text, chain.end):
             return None
         start = max(start, chain.start - self.max_chars)
         window = text[start : chain.start]
-        for stop in _SENTENCE_END_RE.finditer(window):
+        for stop in _SENTENCE_END_RE.finditer(window) if one_sentence else ():
             start, window = start + stop.end(), window[stop.end() :]
         tokens = [Token(self.spell(t.text), t.start, t.end) for t in tokenize(window)][-self.max_tokens :]
-        lemmas = [self.lemmatizer.key(t) for t in tokens]
+        keys = self.keys(tokens)
         spans = [
-            (start + tokens[i].start, start + tokens[j - 1].end, " ".join(lemmas[i:j]))
+            (start + tokens[i].start, start + tokens[j - 1].end, " ".join(filter(None, keys[i:j])))
             for i in range(len(tokens))
             for j in range(i + 1, len(tokens) + 1)
-            if _DOC_WORD_RE.search(window, tokens[i].start, tokens[j - 1].end)
+            if keys[i] and keys[j - 1] and _DOC_WORD_RE.search(window, tokens[i].start, tokens[j - 1].end)
         ]
         if not spans:
             return None
@@ -189,5 +230,5 @@ class LawResolver:
 
     def lookup(self, name: str) -> List[int]:
         """Laws whose alias has exactly the same lemmas as `name`."""
-        key = self.lemmatizer.text(normalize(name))
+        key = self.text_key(normalize(name))
         return sorted({law for law, k in zip(self.alias_law, self.alias_keys) if k == key})
